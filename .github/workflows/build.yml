@@ -12,6 +12,8 @@ on:
       pkg_repos: { required: false, type: string, default: '' }
       test_only: { required: false, type: boolean, default: false }
       clean_build: { required: false, type: boolean, default: false }
+    secrets:
+      DB_PASS: { required: false }
 
 jobs:
   build:
