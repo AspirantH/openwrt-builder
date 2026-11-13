@@ -1,0 +1,5 @@
+#!/bin/sh
+# default theme: carbon (the pipeline's only uci-defaults customization)
+uci set luci.main.mediaurlbase='/luci-static/carbon'
+uci commit luci
+exit 0

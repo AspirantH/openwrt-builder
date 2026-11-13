@@ -1,0 +1,310 @@
+name: build
+on:
+  workflow_call:
+    inputs:
+      build: { required: true, type: string }
+      source_repo: { required: true, type: string }
+      source_ref: { required: true, type: string }
+      source_sha: { required: true, type: string }
+      target: { required: true, type: string }
+      devices: { required: false, type: string, default: '' }
+      digest: { required: true, type: string }
+      pkg_repos: { required: false, type: string, default: '' }
+      test_only: { required: false, type: boolean, default: false }
+      clean_build: { required: false, type: boolean, default: false }
+
+jobs:
+  build:
+    name: ${{ inputs.source_repo }}@${{ inputs.source_ref }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write   # releases
+      actions: write    # delete this build's superseded toolchain caches on a miss
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BUILD: ${{ inputs.build }}
+      SOURCE_REPO: ${{ inputs.source_repo }}
+      SOURCE_REF: ${{ inputs.source_ref }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      TARGET: ${{ inputs.target }}
+      DEVICES: ${{ inputs.devices }}
+      DIGEST: ${{ inputs.digest }}
+      # "name@sha ..." for the third-party repos, resolved once in the plan stage;
+      # the release notes diff it against what the previous release recorded
+      PKG_REPOS: ${{ inputs.pkg_repos }}
+    steps:
+      # Order matters: apt first (it needs room on the root filesystem, which the
+      # next step claims almost all of), then the disk merge, then any checkout —
+      # the merge mounts a volume over the workspace and hides whatever was there.
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt-get -yqq update
+          sudo -E apt-get -yqq install dos2unix libfuse-dev p7zip-full
+          sudo bash -c 'bash <(curl -fsSL https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+
+      # The root filesystem alone cannot hold an OpenWrt tree plus its build
+      # output; runners carry a second, larger disk at /mnt that goes unused.
+      # This merges both into one LVM volume mounted at the workspace, so every
+      # path below stays as written.
+      - name: Merge both runner disks into the workspace
+        if: ${{ !inputs.test_only }}
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 2048        # apt, /tmp and the runner's own logs live on
+          temp-reserve-mb: 128
+          swap-size-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
+      - name: Checkout builder
+        uses: actions/checkout@v7
+        with:
+          path: builder
+
+      - name: Checkout OpenWrt source (pinned SHA)
+        run: |
+          set -euo pipefail
+          git init openwrt
+          cd openwrt
+          git remote add origin "https://github.com/${SOURCE_REPO}.git"
+          # One commit is enough: the toolchain cache key is built from tree
+          # hashes (`git rev-parse HEAD:tools`), which need no history.
+          git fetch --depth=1 --no-tags origin "$SOURCE_SHA"
+          git checkout -q FETCH_HEAD
+          echo "source: ${SOURCE_REPO}@${SOURCE_SHA} (${SOURCE_REF})"
+
+      - name: Feeds
+        working-directory: openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Add third-party packages
+        run: bash builder/scripts/clone-packages.sh builder/firmware/packages.ini openwrt
+
+      # Source-tree patches that must exist before defconfig reads the tree
+      # (version string, feed file surgery). Each patch verifies its own effect
+      # and fails the build when upstream moved; scripts/preset-*.sh below is
+      # the post-defconfig counterpart for config-dependent preparation.
+      - name: Tree patches
+        run: bash builder/scripts/patch-tree.sh openwrt
+
+      - name: Files overlay (uci-defaults + board.d)
+        run: |
+          mkdir -p openwrt/files/etc/uci-defaults
+          cp builder/firmware/uci-defaults/* openwrt/files/etc/uci-defaults/
+          # shellcheck disable=SC2086
+          bash builder/scripts/gen-firmware-defaults.sh builder/firmware/settings.ini openwrt/files "$BUILD" $DEVICES
+          chmod +x openwrt/files/etc/uci-defaults/*
+          if [ -d openwrt/files/etc/board.d ]; then chmod +x openwrt/files/etc/board.d/*; fi
+
+      - name: Generate config
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          bash ../builder/scripts/gen-config.sh "$TARGET" $DEVICES > .config
+          # what gets built is decided here and only here: common.config for every
+          # build, then this build's overlay on top
+          cat ../builder/firmware/config/common.config >> .config
+          if [ -f "../builder/firmware/config/${BUILD}.config" ]; then
+            cat "../builder/firmware/config/${BUILD}.config" >> .config
+          fi
+          make defconfig
+
+      - name: 'Guard: devices & packages alive'
+        working-directory: openwrt
+        run: |
+          # every CONFIG_PACKAGE_*=y we asked for must survive defconfig, in both layers
+          # shellcheck disable=SC2086
+          bash ../builder/scripts/check-selected.sh .config "$TARGET" ../builder/firmware/config/common.config $DEVICES
+          if [ -f "../builder/firmware/config/${BUILD}.config" ]; then
+            # shellcheck disable=SC2086
+            bash ../builder/scripts/check-selected.sh .config "$TARGET" "../builder/firmware/config/${BUILD}.config" $DEVICES
+          fi
+
+      - name: Upload final config (test-only ends here)
+        uses: actions/upload-artifact@v4
+        with:
+          name: config-${{ inputs.build }}
+          path: openwrt/.config
+          # .config is hidden and v4 skips hidden files by default; a missing file must fail, not silently succeed
+          include-hidden-files: true
+          if-no-files-found: error
+
+      # Every scripts/preset-*.sh runs here, once the config is final and before
+      # anything is downloaded or compiled. A hook reads .config and exits 0 on
+      # builds that do not concern it, so this step needs no per-build knowledge
+      # and a future plugin that wants build-time preparation adds one script —
+      # this file stays untouched. Today: preset-openclash-core.sh fetches the
+      # OpenClash meta core into the cloned package, so it rides inside the built
+      # package to exactly the devices that install openclash, not the shared
+      # files/; preset-extras.sh prepares the user payloads.
+      - name: Preset hooks
+        if: ${{ !inputs.test_only }}
+        env:
+          DB_PASS: ${{ secrets.DB_PASS }}
+        run: |
+          for h in builder/scripts/preset-*.sh; do
+            [ -e "$h" ] || continue   # unmatched glob: no hooks yet
+            bash "$h" openwrt
+          done
+
+      # The toolchain is a pure function of its sources and the options that
+      # configure it, so the key is built from exactly those two things and
+      # nothing else — not the upstream HEAD, not the repo name. Tree hashes are
+      # content-addressed, so any fork (openwrt, immortalwrt, qosmio, lede…) is
+      # identified by what its toolchain actually contains; two trees that are
+      # byte-identical share a cache, which is correct.
+      # .config is read here rather than earlier because defconfig has to resolve
+      # CONFIG_LINUX_*, CONFIG_LIBC and the gcc/binutils picks first:
+      # toolchain/kernel-headers is part of the toolchain but takes its version
+      # from include/kernel-version.mk, so toolchain/'s tree hash alone would
+      # happily survive a kernel bump that changes what gets built.
+      # Runs on test-only builds too: it is grep plus rev-parse, and it is the one
+      # step here whose inputs are guessed rather than known, so a five-minute
+      # config run should be able to prove the key describes the toolchain.
+      - name: Toolchain cache key
+        id: tckey
+        if: ${{ !inputs.clean_build }}
+        run: |
+          set -euo pipefail
+          # CONFIG_TARGET_DEVICE_* is deliberately not matched: adding a device to
+          # a build must not throw away its toolchain.
+          CFG=$(grep -E '^CONFIG_(TARGET_(ARCH|BOARD|SUBTARGET)|LIBC=|GCC_|BINUTILS_|LINUX_[0-9])' openwrt/.config | sort) || true
+          if [ -z "$CFG" ]; then
+            echo "::error::no toolchain symbols matched in .config — the key would not describe the toolchain"
+            exit 1
+          fi
+          # the Go host compiler lives in staging_dir/hostpkg, inside this cache,
+          # but is packaged by the feed — so its subtree is an input too. Without
+          # it a golang bump would be masked by the stamp-freshening below.
+          GO=$(git -C openwrt/feeds/packages rev-parse HEAD:lang/golang)
+          INPUTS=$(printf '%s\n%s\n%s\n' "$(git -C openwrt rev-parse HEAD:tools HEAD:toolchain)" "$GO" "$CFG")
+          echo "--- toolchain key inputs ---"
+          printf '%s\n' "$INPUTS"
+          echo "hash=$(printf '%s\n' "$INPUTS" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      # Immutable for a given key, and the expensive half: an exact hit means
+      # actions/cache skips the upload entirely, so an unchanged toolchain costs
+      # zero bytes of the repo's 10 GB quota.
+      - name: Toolchain cache
+        id: toolchain
+        if: ${{ !inputs.test_only && !inputs.clean_build }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            openwrt/staging_dir/host*
+            openwrt/staging_dir/tool*
+          key: toolchain-${{ inputs.build }}-${{ steps.tckey.outputs.hash }}
+
+      # A miss means the key moved, and this cache is looked up by exact key with
+      # no restore-keys — so every entry already stored for this build is now
+      # unreachable forever, not merely old. Delete them here rather than leaving
+      # them to the prune job: that runs after all three builds have uploaded a
+      # fresh ~1.3 GB ccache, which is exactly when the 10 GB quota is tightest
+      # and an eviction would land on something still wanted.
+      # KEEP=0 because none of them can ever be restored again. The cost of being
+      # wrong is a rebuild, never a wrong build, and the prune job still holds
+      # KEEP=2 as the ordinary rolling policy for the hit path.
+      - name: Drop superseded toolchain caches
+        if: ${{ !inputs.test_only && !inputs.clean_build && steps.toolchain.outputs.cache-hit != 'true' }}
+        env:
+          REPO: ${{ github.repository }}
+          KEEP: '0'
+        run: bash builder/scripts/prune-caches.sh "toolchain-${BUILD}-"
+
+      # The other half is an accumulating blob that wants rolling updates, which
+      # is why it is a separate entry: sharing one key with the toolchain would
+      # force a choice between "never re-upload" and "keep it fresh".
+      - name: ccache
+        if: ${{ !inputs.test_only && !inputs.clean_build }}
+        uses: actions/cache@v4
+        with:
+          path: openwrt/.ccache
+          key: ccache-${{ inputs.build }}-${{ github.run_id }}
+          restore-keys: ccache-${{ inputs.build }}-
+
+      - name: Skip toolchain build (cache hit)
+        if: ${{ steps.toolchain.outputs.cache-hit == 'true' }}
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          # drop the toolchain stamps from the top-level dependency lines so make
+          # accepts the restored staging_dir instead of rebuilding into it.
+          # shellcheck disable=SC2016  # $(tools/stamp-compile) is literal Makefile text, not a subshell
+          sed -i 's/ $(tool.*\/stamp-compile)//; s/ $(tool.*\/stamp-install)//' Makefile
+          # printed so a silently-ineffective sed shows up as an unpatched line
+          grep -nE '^(prepare|world):' Makefile
+          # The cache also carries feed-built host tools — above all the Go
+          # compiler (~30 min per run). Their stamps are older than this fresh
+          # checkout, which make reads as stale and rebuilds. Touch them newer:
+          # what the cache holds is current for this key, since the golang feed
+          # subtree is one of the key's inputs. Stamps only exist for artifacts
+          # the cache really contains, so a thin cache degrades to a rebuild,
+          # never to a missing tool.
+          find staging_dir -path '*/stamp/*' -type f -not -path '*target*' -exec touch {} +
+
+      - name: Reproducible build env (clean build)
+        if: ${{ inputs.clean_build && !inputs.test_only }}
+        working-directory: openwrt
+        run: |
+          {
+            echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)"
+            echo "KBUILD_BUILD_USER=builder"
+            echo "KBUILD_BUILD_HOST=github"
+          } >> "$GITHUB_ENV"
+
+      - name: Download sources
+        if: ${{ !inputs.test_only }}
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            make download -j"$(nproc)" && break
+            echo "download failed, retry $i..."
+            sleep 5
+          done
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: Build firmware
+        if: ${{ !inputs.test_only }}
+        working-directory: openwrt
+        run: make -j"$(nproc)" || make -j1 V=s
+
+      # printed win or lose, so a future "no space left" has numbers to reason from
+      - name: Disk usage
+        if: ${{ !cancelled() && !inputs.test_only }}
+        run: df -h / /mnt "$GITHUB_WORKSPACE"
+
+      - name: Collect artifacts
+        if: ${{ !inputs.test_only }}
+        id: organize
+        run: |
+          set -euo pipefail
+          DATE=$(TZ=Asia/Shanghai date +%Y%m%d-%H%M)
+          # upload/ is what ships; meta/ holds profiles.json and every per-device
+          # manifest, which the release notes read and nobody uploads
+          bash builder/scripts/collect-artifacts.sh openwrt upload meta
+          KERNEL=$(find openwrt/bin/targets -name '*.manifest' -exec grep -m1 -oE 'kernel[^0-9]*[0-9]+\.[0-9]+\.[0-9]+' {} \; | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo unknown)
+          {
+            echo "date=$DATE"
+            echo "kernel=$KERNEL"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        if: ${{ !inputs.test_only }}
+        env:
+          REPO: ${{ github.repository }}
+          DATE: ${{ steps.organize.outputs.date }}
+          KERNEL: ${{ steps.organize.outputs.kernel }}
+        run: |
+          bash builder/scripts/publish-release.sh meta upload \
+            builder/firmware/settings.ini builder/firmware/packages.ini \
+            builder/firmware/release.md openwrt/package/custom
