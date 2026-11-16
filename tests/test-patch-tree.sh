@@ -37,9 +37,11 @@ printf '{ "read": { "uci": [ "getLEDs", "getSystemInfo" ] } }\n' \
 
 sh "$sc" "$owrt"
 
-# version.mk: date revision, and VERSION_CODE follows it
-grep -qE '^REVISION:=[0-9]{2}\.[0-9]{2}\.[0-9]{4}$' "$owrt/include/version.mk" \
-  || { echo "FAIL: REVISION not set to a date"; exit 1; }
+# version.mk: date revision (pure hex digits — apk allows only hex after the
+# '~' in base-files' "$(COMMITCOUNT)~$(lastword REVISION)" package version),
+# and VERSION_CODE follows it
+grep -qE '^REVISION:=[0-9]{8}$' "$owrt/include/version.mk" \
+  || { echo "FAIL: REVISION not set to a compact date"; exit 1; }
 grep -q '^VERSION_CODE:=\$(REVISION)$' "$owrt/include/version.mk" \
   || { echo "FAIL: VERSION_CODE not rewired"; exit 1; }
 

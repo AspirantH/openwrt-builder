@@ -12,9 +12,13 @@ owrt=$1
 # ---- firmware version: date-based revision -------------------------------
 # REVISION normally comes from git-describe of the openwrt tree; here the
 # build date is more meaningful. include/version.mk wires it into the banner.
+# Must stay pure hex digits: base-files builds its package version as
+# "$(COMMITCOUNT)~$(lastword of REVISION)" and apk's grammar allows only hex
+# characters after '~' — a dotted date (11.13.2026) fails apk mkpkg with
+# "package version is invalid".
 vmk="$owrt/include/version.mk"
 [ -f "$vmk" ] || { echo "patch-tree: $vmk missing" >&2; exit 1; }
-rev=$(date +%m.%d.%Y)
+rev=$(date +%Y%m%d)
 sed -i -e "/\(# \)\?REVISION:=/c\REVISION:=$rev" \
        -e '/^VERSION_CODE:=/c\VERSION_CODE:=$(REVISION)' "$vmk"
 grep -q "^REVISION:=$rev$" "$vmk" || { echo "patch-tree: REVISION patch did not take ($vmk)" >&2; exit 1; }
